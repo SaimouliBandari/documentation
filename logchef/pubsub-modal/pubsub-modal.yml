@@ -221,47 +221,43 @@ configs:
       type = "remap"
       inputs = ["pubsub_logs"]
       source = '''
-        # Pub/Sub envelope usually has "message" as string.
-        # If already structured, this will still work as long as .message is JSON string.
-        . = parse_json!(.message)
+        # Step 1: normalize event "root" to your log object
+        log = {}
 
-        payload = if is_object(.jsonPayload) { .jsonPayload } else { {} }
+        if is_string(.message) {
+          # If message is a JSON string
+          log, err = parse_json(.message)
+          if err != null { abort }  # drop bad messages instead of flooding errors
+        } else if is_object(.message) {
+          # If decoding already converted it
+          log = .message
+        } else if is_object(.) && exists(.jsonPayload) {
+          # Sometimes the whole event already is the log
+          log = .
+        } else {
+          abort
+        }
 
-        # ---- timestamp ----
+        # Now operate on `log`
+        payload = if is_object(log.jsonPayload) { log.jsonPayload } else { {} }
+
+        # ---- timestamp (string for ClickHouse JSONEachRow) ----
         ts = now()
         if is_string(payload.timestamp) {
           parsed, err = parse_timestamp(payload.timestamp, format: "%+")
           if err == null { ts = parsed }
         }
-        # IMPORTANT: send as STRING for ClickHouse JSONEachRow
         .timestamp = format_timestamp!(ts, format: "%Y-%m-%d %H:%M:%S.%3f")
 
         # ---- body ----
-        if exists(.message) {
-          .body = to_string!(.message)
-        } else {
-          .body = "log"
-        }
+        .body = if exists(log.message) { to_string!(log.message) } else { "log" }
 
         # ---- service / namespace ----
-        if exists(payload.service) {
-          .service_name = to_string!(payload.service)
-        } else {
-          .service_name = "unknown-service"
-        }
-
-        if is_object(.resource) && exists(.resource.type) {
-          .namespace = to_string!(.resource.type)
-        } else {
-          .namespace = "gcp"
-        }
+        .service_name = if exists(payload.service) { to_string!(payload.service) } else { "unknown-service" }
+        .namespace = if is_object(log.resource) && exists(log.resource.type) { to_string!(log.resource.type) } else { "gcp" }
 
         # ---- severity ----
-        if exists(.severity) {
-          .severity_text = upcase(to_string!(.severity))
-        } else {
-          .severity_text = "INFO"
-        }
+        .severity_text = if exists(log.severity) { upcase(to_string!(log.severity)) } else { "INFO" }
 
         if .severity_text == "ERROR" {
           .severity_number = 17
@@ -273,9 +269,9 @@ configs:
           .severity_number = 9
         }
 
-        # ---- attributes (as Map(String,String) friendly) ----
+        # ---- attributes (force strings) ----
         labels = {}
-        if is_object(.resource) && is_object(.resource.labels) { labels = .resource.labels }
+        if is_object(log.resource) && is_object(log.resource.labels) { labels = log.resource.labels }
 
         meta = {}
         if is_object(payload.meta) { meta = payload.meta }
@@ -283,9 +279,7 @@ configs:
         data = {}
         if is_object(meta.data) { data = meta.data }
 
-        # Build attributes with explicit null handling (no lambdas in VRL)
         .log_attributes = {}
-
         .log_attributes.trace_id = if payload.traceId == null { "" } else { to_string!(payload.traceId) }
         .log_attributes.url = if payload.url == null { "" } else { to_string!(payload.url) }
         .log_attributes.method = if payload.method == null { "" } else { to_string!(payload.method) }
@@ -299,10 +293,6 @@ configs:
 
         .log_attributes.amount = if data.amount == null { "" } else { to_string!(data.amount) }
         .log_attributes.payment_method = if data.paymentMethod == null { "" } else { to_string!(data.paymentMethod) }
-
-        # cleanup big fields
-        del(.jsonPayload)
-        del(.resource)
       '''
 
       #################################
