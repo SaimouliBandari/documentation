@@ -202,97 +202,101 @@ configs:
       project = "supertails-backend"
       subscription = "app-logs-sub"
 
-      # Use ONE of these:
-      # 1) Recommended: mount creds and set credentials_path
-      # credentials_path = "/etc/vector/gcp-key.json"
-      #
-      # 2) Or set env var in docker-compose:
-      # GOOGLE_APPLICATION_CREDENTIALS=/etc/vector/gcp-key.json
-
-      # Decode Pub/Sub message bytes as JSON (so `.message` becomes a string field inside the event)
-      # If your events already arrive as structured logs, you can remove decoding.
-      [sources.pubsub_logs.decoding]
-      codec = "json"
+      # If you use a service account inside the container:
+      # auth.strategy = "service_account"
+      # auth.service_account_key_file = "/etc/vector/gcp-key.json"
 
       #################################
-      # TRANSFORM: PARSE & NORMALIZE
+      # TRANSFORM: NORMALIZE
       #################################
       [transforms.remap_logs]
       type = "remap"
       inputs = ["pubsub_logs"]
       source = '''
-        # Step 1: normalize event "root" to your log object
-        log = {}
+        # Pub/Sub gives your app log as a JSON string inside .message
+        raw = ""
+        if exists(.message) { raw = to_string!(.message) }
 
-        if is_string(.message) {
-          # If message is a JSON string
-          log, err = parse_json(.message)
-          if err != null { abort }  # drop bad messages instead of flooding errors
-        } else if is_object(.message) {
-          # If decoding already converted it
-          log = .message
-        } else if is_object(.) && exists(.jsonPayload) {
-          # Sometimes the whole event already is the log
-          log = .
-        } else {
+        obj, err = parse_json(raw)
+        if err != null || !is_object(obj) {
+          # if it's not JSON, keep raw so you can debug in CH
+          .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S.%3f")
+          .trace_id = ""
+          .span_id = ""
+          .trace_flags = 0
+          .severity_text = "INFO"
+          .severity_number = 9
+          .service_name = "unknown-service"
+          .namespace = "gcp"
+          .body = raw
+          .meta = "{}"
+          .log_attributes = {}
           abort
         }
 
-        # Now operate on `log`
-        payload = if is_object(log.jsonPayload) { log.jsonPayload } else { {} }
+        payload = if is_object(obj.jsonPayload) { obj.jsonPayload } else { {} }
+        res     = if is_object(obj.resource) { obj.resource } else { {} }
+        labels  = if is_object(res.labels) { res.labels } else { {} }
+        metaobj = if is_object(payload.meta) { payload.meta } else { {} }
 
-        # ---- timestamp (string for ClickHouse JSONEachRow) ----
+        # --- timestamp: convert RFC3339 -> ClickHouse-friendly string ---
         ts = now()
-        if is_string(payload.timestamp) {
-          parsed, err = parse_timestamp(payload.timestamp, format: "%+")
-          if err == null { ts = parsed }
+        if exists(payload.timestamp) && is_string(payload.timestamp) {
+          ts2, e2 = parse_timestamp(payload.timestamp, format: "%+")
+          if e2 == null { ts = ts2 }
         }
         .timestamp = format_timestamp!(ts, format: "%Y-%m-%d %H:%M:%S.%3f")
 
-        # ---- body ----
-        .body = if exists(log.message) { to_string!(log.message) } else { "log" }
+        # --- core fields ---
+        .trace_id = if exists(payload.traceId) { to_string!(payload.traceId) } else { "" }
+        .span_id = ""
+        .trace_flags = 0
 
-        # ---- service / namespace ----
+        sev = "INFO"
+        if exists(obj.severity) { sev = upcase(to_string!(obj.severity)) }
+        .severity_text = sev
+
+        # compute severity_number safely (no "else if" statement syntax issues)
+        sevnum = 9
+        if sev == "ERROR" { sevnum = 17 }
+        if sev == "WARN"  { sevnum = 13 }
+        if sev == "DEBUG" { sevnum = 5 }
+        .severity_number = sevnum
+
         .service_name = if exists(payload.service) { to_string!(payload.service) } else { "unknown-service" }
-        .namespace = if is_object(log.resource) && exists(log.resource.type) { to_string!(log.resource.type) } else { "gcp" }
+        .namespace = if exists(res.type) { to_string!(res.type) } else { "gcp" }
 
-        # ---- severity ----
-        .severity_text = if exists(log.severity) { upcase(to_string!(log.severity)) } else { "INFO" }
+        # body should be the real log message, not the JSON blob
+        .body = if exists(obj.message) { to_string!(obj.message) } else { "" }
 
-        if .severity_text == "ERROR" {
-          .severity_number = 17
-        } else if .severity_text == "WARN" {
-          .severity_number = 13
-        } else if .severity_text == "DEBUG" {
-          .severity_number = 5
-        } else {
-          .severity_number = 9
+        # meta stored as JSON string (queryable later)
+        .meta = encode_json(metaobj)
+
+        # attributes as strings (Map(String,String) compatible)
+        url = if exists(payload.url) { to_string!(payload.url) } else { "" }
+        method = if exists(payload.method) { to_string!(payload.method) } else { "" }
+
+        project_id = if exists(labels.project_id) { to_string!(labels.project_id) } else { "" }
+        module_id  = if exists(labels.module_id)  { to_string!(labels.module_id) } else { "" }
+        version_id = if exists(labels.version_id) { to_string!(labels.version_id) } else { "" }
+        instance_id = if exists(labels.instance_id) { to_string!(labels.instance_id) } else { "" }
+        deployment_id = if exists(labels.deployment_id) { to_string!(labels.deployment_id) } else { "" }
+        memory = if exists(labels.memory) { to_string!(labels.memory) } else { "" }
+
+        .log_attributes = {
+          "url": url,
+          "method": method,
+          "project_id": project_id,
+          "module_id": module_id,
+          "version_id": version_id,
+          "instance_id": instance_id,
+          "deployment_id": deployment_id,
+          "memory": memory
         }
 
-        # ---- attributes (force strings) ----
-        labels = {}
-        if is_object(log.resource) && is_object(log.resource.labels) { labels = log.resource.labels }
-
-        meta = {}
-        if is_object(payload.meta) { meta = payload.meta }
-
-        data = {}
-        if is_object(meta.data) { data = meta.data }
-
-        .log_attributes = {}
-        .log_attributes.trace_id = if payload.traceId == null { "" } else { to_string!(payload.traceId) }
-        .log_attributes.url = if payload.url == null { "" } else { to_string!(payload.url) }
-        .log_attributes.method = if payload.method == null { "" } else { to_string!(payload.method) }
-
-        .log_attributes.project_id = if labels.project_id == null { "" } else { to_string!(labels.project_id) }
-        .log_attributes.module_id = if labels.module_id == null { "" } else { to_string!(labels.module_id) }
-        .log_attributes.version_id = if labels.version_id == null { "" } else { to_string!(labels.version_id) }
-        .log_attributes.instance_id = if labels.instance_id == null { "" } else { to_string!(labels.instance_id) }
-        .log_attributes.deployment_id = if labels.deployment_id == null { "" } else { to_string!(labels.deployment_id) }
-        .log_attributes.memory = if labels.memory == null { "" } else { to_string!(labels.memory) }
-
-        .log_attributes.amount = if data.amount == null { "" } else { to_string!(data.amount) }
-        .log_attributes.payment_method = if data.paymentMethod == null { "" } else { to_string!(data.paymentMethod) }
+        # cleanup
+        del(.attributes)
+        del(.message)
       '''
 
       #################################
@@ -303,15 +307,11 @@ configs:
       inputs = ["remap_logs"]
       endpoint = "http://clickhouse:8123"
       database = "default"
-      table = "logs"
-
-      # REQUIRED to match ClickHouse INSERT ... FORMAT JSONEachRow
-      format = "json_each_row"
-
-      compression = "gzip"
-      skip_unknown_fields = true
+      table = "supertails_logs"
       healthcheck.enabled = false
-    
+      skip_unknown_fields = true
+      compression = "gzip"   
+
   clickhouse_config:
     content: |
       <clickhouse replace="true">
