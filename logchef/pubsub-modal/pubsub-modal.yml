@@ -201,37 +201,49 @@ configs:
       type = "gcp_pubsub"
       project = "supertails-backend"
       subscription = "app-logs-sub"
-      # IMPORTANT:
-      # Vector will use Google Application Default Credentials (ADC).
-      # In Docker, pass creds via env on the vector container:
-      #   - GOOGLE_APPLICATION_CREDENTIALS=/etc/vector/gcp-key.json
-      # and mount /etc/vector/gcp-key.json
+
+      # Use ONE of these:
+      # 1) Recommended: mount creds and set credentials_path
+      # credentials_path = "/etc/vector/gcp-key.json"
+      #
+      # 2) Or set env var in docker-compose:
+      # GOOGLE_APPLICATION_CREDENTIALS=/etc/vector/gcp-key.json
+
+      # Decode Pub/Sub message bytes as JSON (so `.message` becomes a string field inside the event)
+      # If your events already arrive as structured logs, you can remove decoding.
+      [sources.pubsub_logs.decoding]
+      codec = "json"
 
       #################################
       # TRANSFORM: PARSE & NORMALIZE
       #################################
+      [transforms.remap_logs]
+      type = "remap"
+      inputs = ["pubsub_logs"]
       source = '''
-        # Pub/Sub message body -> JSON object
+        # Pub/Sub envelope usually has "message" as string.
+        # If already structured, this will still work as long as .message is JSON string.
         . = parse_json!(.message)
 
         payload = if is_object(.jsonPayload) { .jsonPayload } else { {} }
 
-        # --- timestamp ---
+        # ---- timestamp ----
         ts = now()
-        if exists(payload.timestamp) && is_string(payload.timestamp) {
+        if is_string(payload.timestamp) {
           parsed, err = parse_timestamp(payload.timestamp, format: "%+")
           if err == null { ts = parsed }
         }
+        # IMPORTANT: send as STRING for ClickHouse JSONEachRow
         .timestamp = format_timestamp!(ts, format: "%Y-%m-%d %H:%M:%S.%3f")
 
-        # --- body ---
+        # ---- body ----
         if exists(.message) {
           .body = to_string!(.message)
         } else {
           .body = "log"
         }
 
-        # --- service / namespace ---
+        # ---- service / namespace ----
         if exists(payload.service) {
           .service_name = to_string!(payload.service)
         } else {
@@ -244,7 +256,7 @@ configs:
           .namespace = "gcp"
         }
 
-        # --- severity ---
+        # ---- severity ----
         if exists(.severity) {
           .severity_text = upcase(to_string!(.severity))
         } else {
@@ -261,42 +273,34 @@ configs:
           .severity_number = 9
         }
 
-        # --- labels/meta safe extraction ---
+        # ---- attributes (as Map(String,String) friendly) ----
         labels = {}
         if is_object(.resource) && is_object(.resource.labels) { labels = .resource.labels }
 
         meta = {}
         if is_object(payload.meta) { meta = payload.meta }
 
-        # helper: inline "string or empty"
-        trace_id = if exists(payload.traceId) && payload.traceId != null { to_string!(payload.traceId) } else { "" }
-        url      = if exists(payload.url) && payload.url != null { to_string!(payload.url) } else { "" }
-        method   = if exists(payload.method) && payload.method != null { to_string!(payload.method) } else { "" }
+        data = {}
+        if is_object(meta.data) { data = meta.data }
 
-        project_id    = if exists(labels.project_id) && labels.project_id != null { to_string!(labels.project_id) } else { "" }
-        module_id     = if exists(labels.module_id) && labels.module_id != null { to_string!(labels.module_id) } else { "" }
-        version_id    = if exists(labels.version_id) && labels.version_id != null { to_string!(labels.version_id) } else { "" }
-        instance_id   = if exists(labels.instance_id) && labels.instance_id != null { to_string!(labels.instance_id) } else { "" }
-        deployment_id = if exists(labels.deployment_id) && labels.deployment_id != null { to_string!(labels.deployment_id) } else { "" }
-        memory        = if exists(labels.memory) && labels.memory != null { to_string!(labels.memory) } else { "" }
+        # Build attributes with explicit null handling (no lambdas in VRL)
+        .log_attributes = {}
 
-        .log_attributes = {
-          "trace_id": trace_id,
-          "url": url,
-          "method": method,
+        .log_attributes.trace_id = if payload.traceId == null { "" } else { to_string!(payload.traceId) }
+        .log_attributes.url = if payload.url == null { "" } else { to_string!(payload.url) }
+        .log_attributes.method = if payload.method == null { "" } else { to_string!(payload.method) }
 
-          "project_id": project_id,
-          "module_id": module_id,
-          "version_id": version_id,
-          "instance_id": instance_id,
-          "deployment_id": deployment_id,
-          "memory": memory,
+        .log_attributes.project_id = if labels.project_id == null { "" } else { to_string!(labels.project_id) }
+        .log_attributes.module_id = if labels.module_id == null { "" } else { to_string!(labels.module_id) }
+        .log_attributes.version_id = if labels.version_id == null { "" } else { to_string!(labels.version_id) }
+        .log_attributes.instance_id = if labels.instance_id == null { "" } else { to_string!(labels.instance_id) }
+        .log_attributes.deployment_id = if labels.deployment_id == null { "" } else { to_string!(labels.deployment_id) }
+        .log_attributes.memory = if labels.memory == null { "" } else { to_string!(labels.memory) }
 
-          # store full meta as JSON string (always valid string)
-          "meta": encode_json(meta)
-        }
+        .log_attributes.amount = if data.amount == null { "" } else { to_string!(data.amount) }
+        .log_attributes.payment_method = if data.paymentMethod == null { "" } else { to_string!(data.paymentMethod) }
 
-        # cleanup
+        # cleanup big fields
         del(.jsonPayload)
         del(.resource)
       '''
@@ -310,6 +314,10 @@ configs:
       endpoint = "http://clickhouse:8123"
       database = "default"
       table = "logs"
+
+      # REQUIRED to match ClickHouse INSERT ... FORMAT JSONEachRow
+      format = "json_each_row"
+
       compression = "gzip"
       skip_unknown_fields = true
       healthcheck.enabled = false
