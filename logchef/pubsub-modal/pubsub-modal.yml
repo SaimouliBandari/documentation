@@ -1,0 +1,363 @@
+services:
+  logchef:
+    image: ghcr.io/mr-karan/logchef:latest
+    container_name: logchef
+    restart: on-failure
+    ports:
+      # recommended: only expose to localhost, nginx will proxy from 443
+      - "127.0.0.1:8125:8125"
+    configs:
+      - source: logchef_config
+        target: /etc/logchef/config.toml
+        mode: 0444
+    environment:
+      # ensure redirects/callbacks always return to nginx URL
+      - LOGCHEF_SERVER__FRONTEND_URL=https://34.180.23.122.nip.io
+      # trust your self-signed nginx cert for OIDC discovery over HTTPS
+      - SSL_CERT_FILE=/etc/ssl/custom/nginx-ca.crt
+    volumes:
+      - logchef-data:/data
+      - ./nginx-ca.crt:/etc/ssl/custom/nginx-ca.crt:ro
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      dex:
+        condition: service_healthy
+    networks:
+      - logchef_net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8125/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8.4
+    container_name: clickhouse
+    restart: on-failure
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    configs:
+      - source: clickhouse_config
+        target: /etc/clickhouse-server/config.d/logchef.xml
+        mode: 0444
+      - source: clickhouse_users
+        target: /etc/clickhouse-server/users.d/logchef.xml
+        mode: 0444
+      - source: clickhouse_init
+        target: /docker-entrypoint-initdb.d/init-db.sh
+        mode: 0555
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse:delegated
+      - clickhouse-logs:/var/log/clickhouse-server:delegated
+    cap_add:
+      - SYS_NICE
+      - IPC_LOCK
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 262144
+        hard: 262144
+    networks:
+      - logchef_net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  dex:
+    image: dexidp/dex:v2.35.3
+    container_name: dex
+    restart: on-failure
+    ports:
+      # recommended: only expose to localhost, nginx will proxy from 443
+      - "127.0.0.1:5556:5556"
+    configs:
+      - source: dex_config
+        target: /etc/dex/config.yaml
+        mode: 0444
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    networks:
+      - logchef_net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5556/dex/.well-known/openid-configuration"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  vector:
+    image: docker.io/timberio/vector:0.45.0-debian
+    volumes:
+      - ./gcp-key.json:/etc/vector/gcp-key.json:ro
+      - ./vector.toml:/etc/vector/vector.toml:ro
+    configs:
+      - source: vector_config
+        target: /etc/vector/vector.toml
+        mode: 0444
+    depends_on:
+      logchef:
+        condition: service_healthy
+    command: ["-c", "/etc/vector/vector.toml"]
+    networks:
+      - logchef_net
+
+volumes:
+  logchef-data:
+  clickhouse-data:
+  clickhouse-logs:
+
+networks:
+  logchef_net:
+    name: logchef_net
+
+configs:
+  logchef_config:
+    content: |
+      [server]
+      port = 8125
+      host = "0.0.0.0"
+
+      [sqlite]
+      path = "/data/local.db"
+
+      [oidc]
+      # IMPORTANT: must match issuer returned by dex discovery exactly
+      provider_url = "https://34.180.23.122.nip.io/dex"
+      auth_url = "https://34.180.23.122.nip.io/dex/auth"
+      # internal token endpoint is fine (server-side)
+      token_url = "http://dex:5556/dex/token"
+
+      client_id = "logchef"
+      client_secret = "logchef-secret"
+      redirect_url = "https://34.180.23.122.nip.io/api/v1/auth/callback"
+      scopes = ["openid", "email", "profile"]
+
+      [auth]
+      admin_emails = ["admin@logchef.internal"]
+      session_duration = "24h"
+      max_concurrent_sessions = 1
+      api_token_secret = "5679649c50fddda837449b77d9983ab5f8dba65878897e968a74e7061bf47677"
+      default_token_expiry = "2160h"
+
+      [logging]
+      level = "debug"
+
+  dex_config:
+    content: |
+      issuer: https://34.180.23.122.nip.io/dex
+
+      issuerRotation:
+        - issuer: http://dex:5556/dex
+        - issuer: https://34.180.23.122.nip.io/dex
+
+      storage:
+        type: sqlite3
+        config:
+          file: /var/dex/dex.db
+
+      web:
+        http: 0.0.0.0:5556
+        allowedOrigins: ['*']
+
+      staticClients:
+        - id: logchef
+          redirectURIs:
+            - "https://34.180.23.122.nip.io/api/v1/auth/callback"
+          name: "LogChef"
+          secret: logchef-secret
+
+      oauth2:
+        skipApprovalScreen: true
+
+      enablePasswordDB: true
+
+      staticPasswords:
+        - email: "admin@logchef.internal"
+          hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+          username: "admin"
+          userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
+
+        - email: "demo@logchef.internal"
+          hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+          username: "demo-user"
+          userID: "08a8684b-db88-4b73-90a9-3cd1661f5467"
+
+  vector_config:
+    content: |
+      [api]
+      enabled = true
+
+      #################################
+      # SOURCE: GCP PUBSUB
+      #################################
+      [sources.pubsub_logs]
+      type = "gcp_pubsub"
+      project = "supertails-backend"              # <-- change if needed
+      subscription = "app-logs-sub"     # <-- change this
+
+      auth.strategy = "service_account"
+      auth.service_account_key_file = "/etc/vector/gcp-key.json"
+
+      #################################
+      # TRANSFORM: PARSE & NORMALIZE
+      #################################
+      [transforms.remap_logs]
+      inputs = ["pubsub_logs"]
+      type = "remap"
+      source = '''
+        # Parse Pub/Sub message
+        . = parse_json!(.message)
+
+        # Extract actual app payload
+        payload = .jsonPayload
+
+        # Timestamp
+        .timestamp = payload.timestamp ?? now()
+
+        # Human readable log message
+        .body = .message ?? "log"
+
+        # Service information
+        .service_name = payload.service ?? "unknown-service"
+        .namespace = .resource?.type ?? "gcp"
+
+        # Severity mapping
+        .severity_text = upcase(.severity ?? "INFO")
+
+        .severity_number = if .severity_text == "ERROR" {
+          17
+        } else if .severity_text == "WARN" {
+          13
+        } else if .severity_text == "DEBUG" {
+          5
+        } else {
+          9
+        }
+
+        # Store important metadata only (avoid huge cart object)
+        .log_attributes = {
+          "trace_id": payload.traceId,
+          "url": payload.url,
+          "method": payload.method,
+          "project_id": .resource?.labels?.project_id,
+          "module_id": .resource?.labels?.module_id,
+          "version_id": .resource?.labels?.version_id,
+          "amount": payload.meta?.data?.amount,
+          "payment_method": payload.meta?.data?.paymentMethod
+        }
+
+        # Remove large nested objects to save storage
+        del(.jsonPayload)
+        del(.resource)
+        del(.message)
+      '''
+
+      #################################
+      # SINK: CLICKHOUSE
+      #################################
+      [sinks.clickhouse]
+      type = "clickhouse"
+      inputs = ["remap_logs"]
+      endpoint = "http://clickhouse:8123"
+      database = "default"
+      table = "logs"
+      compression = "gzip"
+      healthcheck.enabled = false
+      skip_unknown_fields = true
+  
+  clickhouse_config:
+    content: |
+      <clickhouse replace="true">
+          <logger>
+              <level>debug</level>
+              <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+              <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+              <size>1000M</size>
+              <count>3</count>
+          </logger>
+          <display_name>logchef</display_name>
+          <listen_host>0.0.0.0</listen_host>
+          <http_port>8123</http_port>
+          <tcp_port>9000</tcp_port>
+          <user_directories>
+              <users_xml>
+                  <path>users.xml</path>
+              </users_xml>
+              <local_directory>
+                  <path>/var/lib/clickhouse/access/</path>
+              </local_directory>
+          </user_directories>
+      </clickhouse>
+
+  clickhouse_users:
+    content: |
+      <?xml version="1.0"?>
+      <clickhouse replace="true">
+          <profiles>
+              <default>
+                  <max_memory_usage>10000000000</max_memory_usage>
+                  <use_uncompressed_cache>0</use_uncompressed_cache>
+                  <load_balancing>in_order</load_balancing>
+                  <log_queries>1</log_queries>
+              </default>
+          </profiles>
+          <users>
+              <default>
+                  <access_management>1</access_management>
+                  <profile>default</profile>
+                  <networks>
+                      <ip>::/0</ip>
+                  </networks>
+                  <quota>default</quota>
+                  <access_management>1</access_management>
+                  <named_collection_control>1</named_collection_control>
+                  <show_named_collections>1</show_named_collections>
+                  <show_named_collections_secrets>1</show_named_collections_secrets>
+              </default>
+          </users>
+          <quotas>
+              <default>
+                  <interval>
+                      <duration>3600</duration>
+                      <queries>0</queries>
+                      <errors>0</errors>
+                      <result_rows>0</result_rows>
+                      <read_rows>0</read_rows>
+                      <execution_time>0</execution_time>
+                  </interval>
+              </default>
+          </quotas>
+      </clickhouse>
+
+  clickhouse_init:
+    content: |
+      #!/bin/bash
+      clickhouse client -n <<-EOSQL
+        CREATE DATABASE IF NOT EXISTS default;
+
+        CREATE TABLE IF NOT EXISTS default.logs
+        (
+            timestamp DateTime64(3) CODEC(DoubleDelta, LZ4),
+            severity_text LowCardinality(String) CODEC(ZSTD(1)),
+            severity_number Int32 CODEC(ZSTD(1)),
+            service_name LowCardinality(String) CODEC(ZSTD(1)),
+            namespace LowCardinality(String) CODEC(ZSTD(1)),
+            body String CODEC(ZSTD(1)),
+            log_attributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+
+            INDEX idx_severity_text severity_text TYPE set(100) GRANULARITY 4,
+            INDEX idx_log_attributes_keys mapKeys(log_attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+            INDEX idx_log_attributes_values mapValues(log_attributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+            INDEX idx_body body TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1
+        )
+        ENGINE = MergeTree()
+        PARTITION BY toDate(timestamp)
+        ORDER BY (namespace, service_name, timestamp)
+        TTL toDateTime(timestamp) + INTERVAL 30 DAY
+        SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
+      EOSQL
